@@ -10,7 +10,7 @@ Build cache OS
 This uses debootstrap to install a base debian under /var/cache/lxc
 
     # lxc-wizard --BUILD
-
+    
     ** Container Creation Wizard **
     Creating cache directory... OK
     Creating download directory... OK
@@ -31,10 +31,10 @@ This uses debootstrap to install a base debian under /var/cache/lxc
     I: Retrieving adduser
     I: Validating adduser
     ...
-   Setting up sgml-base (1.26+nmu1) ...
-   Setting up xml-core (0.13) ...
-   Processing triggers for python-support ...
-   OK
+    Setting up sgml-base (1.26+nmu1) ...
+    Setting up xml-core (0.13) ...
+    Processing triggers for python-support ...
+    OK
 
 
 Update cached OS
