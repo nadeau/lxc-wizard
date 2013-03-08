@@ -1,0 +1,592 @@
+#!/usr/bin/perl -w
+
+############################################################
+#                                                          #
+# Copyright (C) 2011-2012  Billy Nadeau                    #
+#                                                          #
+############################################################
+
+use strict;
+use Socket;
+use Getopt::Long;
+
+# Unused
+my $DEBUG = 0;
+my $FAKE = 0;
+
+my $help;
+
+our $finalRC = 1;
+my $rc = 1;
+
+our %Default = (
+    LVM		=> 'Y',
+    LVSize	=> '32G',
+    FSTab	=> 'Y',
+    MEMORY	=> '8G',
+    SWAP	=> '8G',
+    CPU		=> 1024,
+    IO		=> 1000,
+    AUTOSTART	=> 'Y',
+    BUILD 	=> 'Y',
+    REFRESH	=> 'Y',
+    LAUNCH	=> 'Y',
+    CREATE	=> 'Y',
+    GO		=> 'Y'
+);
+
+our $arch = `dpkg --print-architecture`; chomp $arch;
+our $distrib = 'squeeze';
+
+our( $container, $hostname, $domain, $fqdn, $ipaddr, $gwaddr );	# User provided information
+our( $vgname, $lvname, $lvsize, $mountpoint, $rootfs );
+our( $memory, $swap, $cpushares, $ioweight, $autostart, $launch );
+
+my( $LVM, $MOUNT, $FSTAB, $CREATE );	 # Features to manage
+my( $confirm, $AUTO, $BUILD, $REFRESH ); # Local use only
+
+GetOptions( 'help'		=> \$help,
+
+	    'hostname=s'	=> \$hostname,
+	    'domain=s'		=> \$domain,
+	    'fqdn=s'		=> \$fqdn,
+	    'ipaddr=s'		=> \$ipaddr,
+	    'gwaddr=s'		=> \$gwaddr,
+	    'container=s'	=> \$container,
+	    'vgname=s'		=> \$vgname,
+	    'lvname=s'		=> \$lvname,
+	    'lvsize=s'		=> \$lvsize,
+	    'mountpoint=s'	=> \$mountpoint,
+
+	    'autostart=s'	=> \$autostart,
+	    'launch=s'		=> \$launch,
+
+	    'memory=s'		=> \$memory,
+	    'swap=s'		=> \$swap,
+	    'cpushares=s'	=> \$cpushares,
+	    'ioweight=s'	=> \$ioweight,
+
+	    'LVM=s'		=> \$LVM,
+	    'FSTAB=s'		=> \$FSTAB,
+	    'CREATE=s'		=> \$CREATE,
+
+	    'BUILD'		=> \$BUILD,
+	    'REFRESH'		=> \$REFRESH,
+
+	    'AUTO'		=> \$AUTO,
+	    'FAKE'		=> \$FAKE );
+
+#	    'MEMORY=s'		=> \$MEMORY,
+#	    'CPU=s'		=> \$CPU,
+#	    'IO=s'		=> \$IO,
+
+print "\n** Container Creation Wizard **\n";
+
+help() if $help;
+
+sub help
+{
+    print <<EOH;
+Usage: $0 [options]
+
+    --fqdn DQDN		full qualified domain name of the target container
+    --hostname HOST	hostname (if it can't be extracted from the fqdn)
+    --domain DOMAIN	domain name (if it can't be extracted from the fqdn)
+    --ipaddr IPADDR	ip address (if it can't be found by gethost call)
+    --gwaddr IPADDR	gateway address
+
+    blah blah blah rtfsck
+EOH
+}
+
+do
+{
+    if( $BUILD )
+    {
+	$rc = build_cache();
+
+	exit not $rc;
+    }
+
+    if( $REFRESH )
+    {
+	my $cache   = "/var/cache/lxc/rootfs-$distrib-$arch"; # Defined in two places
+
+	print "Updating cached OS... ";
+	$rc =  not system( "chroot $cache /bin/bash -c 'apt-get update'" );
+	$rc += not system( "chroot $cache /bin/bash -c 'apt-get upgrade'" );
+	checkrc( $rc );
+
+	exit not $rc;
+    }
+
+    if( $AUTO )
+    {
+	print "Creating container with the following parameters:\n\n";
+    }
+    else
+    {
+	print "Please enter the following information\n"
+	    . "default values in [], hit enter to accept\n\n";
+    }
+
+    # Container Config
+
+    unless( $fqdn )
+    {
+	$fqdn = "$hostname.$domain" if( defined $hostname and defined $domain );
+    }
+
+    $fqdn = request( "Container FQDN", $fqdn );
+
+    unless( $ipaddr )
+    {
+	if( my $tmp = gethostbyname( $fqdn ) )
+	{
+	    $ipaddr = inet_ntoa( $tmp );
+	}
+    }
+
+    $ipaddr = request( "IP Address", $ipaddr );
+
+    unless( $gwaddr )
+    {
+	$ipaddr =~ /(\d+\.\d+)\.\d+\.\d+/;
+	$gwaddr = $1 . '.0.1';
+    }
+
+    $gwaddr = request( "GW Address", $gwaddr );
+
+    unless( $hostname and $domain )
+    {
+	$fqdn =~ /([^.]+)\./;
+	$hostname = $1;
+	$domain = $';
+    }
+    
+    $container = ucfirst( $hostname )
+	unless( $container );
+
+    $container = request( "Container LXC Name", $container );
+
+    $Default{ LVName } = $container;
+    $Default{ MountPoint } = "/var/lib/lxc/$container";
+
+
+    # LVM Stuff
+
+    $LVM = request_bool( "Create Logical Volume", $LVM || $Default{ LVM } );
+
+    if( $LVM eq 'Y' )
+    {
+	unless( $vgname )
+	{
+	    my @vgs = `vgdisplay | grep Name`;
+	    $vgs[0] =~ /Name\s+(\w+)/;
+
+	    $vgname = $1;
+	}
+
+	$vgname = request( "Logical Volume Group", $vgname );
+	$lvname = request( "Logical Volume Name", $lvname || $Default{ LVName } );
+	$lvsize = request( "Logical Volume Size", $lvsize || $Default{ LVSize } );
+
+	$mountpoint = request( "Mount Point", $mountpoint || $Default{ MountPoint } );
+    }
+    else
+    {
+	$mountpoint = request( "Base directory", $mountpoint || $Default{ MountPoint } );
+    }
+
+
+    # LXC Config
+
+    $memory = request( "Container Memory Limit", $memory || $Default{ MEMORY } );
+    $swap = request( "Container Memory+Swap Limit", $swap || $memory );
+    $cpushares = request( "Container CPU Shares", $cpushares || $Default{ CPU } );
+    $ioweight = request( "Container IO Weight", $ioweight || $Default{ IO } );
+
+
+    # Container installation
+
+    $CREATE = request_bool( "Install container OS", $CREATE || $Default{ CREATE } );
+
+    $autostart = request_bool( "Set to autostart on boot", $autostart || $Default{ AUTOSTART } );
+    $launch = request_bool( "Start container when finished", $launch || $Default{ LAUNCH } );
+
+    ## VERIFY ##
+
+    print "\n";
+    print "Please verify all information:\n";
+    print "\n";
+    print "Container Name:        $container\n";
+    print "Container FQDN:        $fqdn\n";
+    print "Container IP:          $ipaddr\n";
+    print "Container GW:          $gwaddr\n";
+    print "\n";
+    print "Create Logical Volume: $LVM\n";
+    print "Volume Group:          $vgname\n"	if $LVM eq 'Y';
+    print "Volume Name:           $lvname\n"	if $LVM eq 'Y';
+    print "Volume Size:           $lvsize\n"	if $LVM eq 'Y';
+    print "Mount Point:           $mountpoint\n" if $LVM eq 'Y';
+    print "Dest Directory:        $mountpoint\n" if $LVM eq 'N';
+    print "\n";
+    print "Memory Limit:          $memory\n";
+    print "Memory+Swap Limit:     $swap\n";
+    print "CPU Shares:            $cpushares\n";
+    print "IO Weight:             $ioweight\n";
+    print "\n";
+    print "Set to start on boot:  $autostart\n";
+    print "Start after setup:     $launch\n";
+    print "Install OS:            $CREATE\n";
+    print "\n";
+
+    $confirm = request( "Is everything right", $Default{ GO } );
+}
+until( $confirm eq 'Y' );
+
+print "\n";
+
+
+if( $LVM eq 'Y' )
+{
+    print "Creating Logical Volume... ";
+    $rc = not system( "lvcreate -L $lvsize -n $lvname $vgname" );
+    checkrc( $rc );
+
+    print "Creating Filesystem... ";
+    $rc = not system( "mkfs -t ext4 -L $lvname -m 0 /dev/$vgname/$lvname" );
+    checkrc( $rc );
+
+    print "Tuning Filesystem... ";
+    $rc = not system( "tune2fs -i 0 -c 0 /dev/$vgname/$lvname" );
+    checkrc( $rc );
+
+    print "Creating Mount Point... ";
+    $rc = mkdir $mountpoint;
+    checkrc( $rc );
+
+    print "Mounting Filesystem... ";
+    $rc = not system( "mount /dev/$vgname/$lvname $mountpoint" );
+    checkrc( $rc );
+
+    print "Updating /etc/fstab... ";
+    open FSTAB, ">>/etc/fstab";
+    $rc = print FSTAB "/dev/$vgname/$lvname\t$mountpoint\text4\tnoatime 0 2\n";
+    close FSTAB;
+    checkrc( $rc );
+}
+else
+{
+    print "Creating target directory... ";
+    $rc = not system( "mkdir -p $mountpoint" );
+    checkrc( $rc );
+}
+
+if( $CREATE eq 'Y' )
+{
+    # Brute SH-to-Perl transliteration follows
+
+    $rootfs = "$mountpoint/rootfs";
+
+    print "Copying cached container template... ";
+    $rc = not system( "cp -a /var/cache/lxc/rootfs-$distrib-$arch $rootfs" );
+    checkrc( $rc );
+
+    open  HOSTNAME, ">$rootfs/etc/hostname";
+    print HOSTNAME  $hostname . "\n";
+    close HOSTNAME;
+    
+    open  INTERFACES, ">$rootfs/etc/network/interfaces";
+    print INTERFACES  etc_interfaces();
+    close INTERFACES;
+
+    open  RESOLVCONF, ">$rootfs/etc/resolv.conf";
+    print RESOLVCONF  etc_resolvconf();
+    close RESOLVCONF;
+
+    open  CONFIG, ">$mountpoint/config";
+    print CONFIG  lxc_config();
+    close CONFIG;
+}
+
+if( $launch eq 'Y' )
+{
+    print "Starting container... ";
+    $rc = not system( "lxc-start -d -n $container" );
+    checkrc( $rc );
+}
+
+if( $finalRC )
+{
+    print "Good, everything seemed to work!\n";
+}
+else
+{
+    print "Shit happened.\n";
+}
+
+print "\n";
+
+exit 0;
+
+
+###  General Subs  ###
+
+sub request_bool
+{
+    my( $string, $default ) = @_;
+    my( $tmp );
+
+    $default ||= '';
+
+    print $string . " [$default] : ";
+
+    if( $AUTO )
+    {
+	print "$default\n";
+	return $default;
+    }
+
+    $tmp = <STDIN>;
+    chomp $tmp;
+
+    $tmp = $default unless $tmp;
+
+    return $tmp =~ /^[YyOo]/ ? 'Y' : 'N';
+}
+
+sub request
+{
+    my( $string, $default ) = @_;
+    my( $tmp );
+
+    $default ||= '';
+
+    print $string . " [$default] : ";
+
+    if( $AUTO )
+    {
+	print "$default\n";
+	return $default;
+    }
+
+    $tmp = <STDIN>;
+    chomp $tmp;
+
+    return $tmp? $tmp : $default;
+}
+
+sub checkrc
+{
+    my $rc = shift;
+    if( $rc )
+    {
+	print "OK\n";
+    }
+    else
+    {
+	print "error!\n";
+
+	my $answer;
+
+	do
+	{
+	    print "Abort [A] or Continue [C]? ";
+
+	    $answer = <STDIN>; chomp $answer;
+	}
+	until( $answer =~ /[AaCc]/ );
+
+	die "Sorry\n" if $answer =~ /[Aa]/i;
+    }
+
+    $finalRC &&= $rc;
+}
+
+
+###  Cached FS File Content Subs  ###
+
+sub build_cache
+{
+    my $partial = "/var/cache/lxc/partial-$distrib-$arch";
+    my $cache = "/var/cache/lxc/rootfs-$distrib-$arch";
+
+    my $mirror = 'http://mirror.peer1.net/debian';
+
+    my $packages = 'locales,dialog,libui-dialog-perl,'
+	. 'ifupdown,netbase,net-tools,iproute,inetutils-ping,'
+	. 'vim,openssh-server,debian-keyring';
+
+    die "Cache directory already exists; not overwriting\n"
+	if( -d $cache );
+
+    print "Creating cache directory... ";
+    $rc = mkdir '/var/cache/lxc';
+    checkrc( $rc );
+
+    print "Creating download directory... ";
+    $rc = mkdir $partial;
+    checkrc( $rc );
+
+    print "Downloading Debian minimal...\n";
+    $rc = not system( "debootstrap --verbose --variant=minbase --arch=$arch " .
+		  "--include=$packages $distrib $partial $mirror" );
+    checkrc( $rc );
+
+    print "Renaming cache directory... ";
+    $rc = rename $partial, $cache;
+    checkrc( $rc );
+
+    print "Fixing network status path... ";
+    $rc = unlink "$cache/etc/network/run";
+    $rc += not system( "ln -s /dev/shm $cache/etc/network/run" );
+    checkrc( $rc );
+
+    print "Updating apt configs... ";
+    open  SOURCES, ">$cache/etc/apt/sources.list";
+    $rc = print SOURCES  etc_sourceslist();
+    close SOURCES;
+    checkrc( $rc );
+
+    open  PREFERENCES, ">$cache/etc/apt/preferences";
+    $rc = print PREFERENCES etc_preferences();
+    close PREFERENCES;
+    checkrc( $rc );
+
+    print "Adding host link... ";
+    $rc = not system( "touch $cache/etc/host" );
+    checkrc( $rc );
+
+    print "Installing puppet...\n";
+    $rc =  not system( "chroot $cache /bin/bash -c 'apt-get update'" );
+    $rc += not system( "chroot $cache /bin/bash -c 'yes | apt-get install puppet'" );
+    checkrc( $rc );
+
+    return $rc;
+}
+
+sub etc_inittab
+{
+    return <<EOF;
+id:3:initdefault:
+si::sysinit:/etc/init.d/rcS
+l0:0:wait:/etc/init.d/rc 0
+l1:1:wait:/etc/init.d/rc 1
+l2:2:wait:/etc/init.d/rc 2
+l3:3:wait:/etc/init.d/rc 3
+l4:4:wait:/etc/init.d/rc 4
+l5:5:wait:/etc/init.d/rc 5
+l6:6:wait:/etc/init.d/rc 6
+# Normally not reached, but fallthrough in case of emergency.
+z6:6:respawn:/sbin/sulogin
+1:2345:respawn:/sbin/getty 38400 console
+c1:12345:respawn:/sbin/getty 38400 tty1 linux
+EOF
+}
+
+sub etc_sourceslist
+{
+    return <<EOF;
+deb http://it.mate1/debian                      squeeze         main
+deb http://mirror.peer1.net/debian              squeeze         main
+deb http://mirror.peer1.net/debian-security     squeeze/updates main
+deb http://mirror.peer1.net/debian              wheezy          main
+deb http://mirror.peer1.net/debian-security     wheezy/updates  main
+EOF
+}
+
+sub etc_preferences
+{
+    return <<EOF;
+Package: *
+Pin: origin it.mate1
+Pin-Priority: 1001
+
+Package: *
+Pin: release n=squeeze
+Pin-Priority: 990
+
+Package: *
+Pin: release n=wheezy
+Pin-Priority: 1
+
+Package: puppet
+Pin: release n=wheezy
+Pin-Priority: 995
+
+Package: puppet-common
+Pin: release n=wheezy
+Pin-Priority: 995
+EOF
+}
+
+###  Container File Content Subs  ###
+
+sub lxc_config
+{
+    return <<EOF;
+lxc.utsname = $hostname
+
+lxc.tty = 1
+lxc.pts = 1024
+lxc.rootfs = $rootfs
+
+lxc.network.type = veth
+lxc.network.flags = up
+lxc.network.link = br0
+
+lxc.cgroup.memory.limit_in_bytes = $memory
+lxc.cgroup.memory.memsw.limit_in_bytes = $swap
+lxc.cgroup.cpu.shares = $cpushares
+lxc.cgroup.blkio.weight = $ioweight
+
+# mount points
+lxc.mount.entry=proc $rootfs/proc proc nodev,noexec,nosuid 0 0
+lxc.mount.entry=sysfs $rootfs/sys sysfs defaults  0 0
+lxc.mount.entry=/etc/hostname $rootfs/etc/host none ro,bind 0 0
+
+lxc.cgroup.devices.deny = a
+# /dev/null and zero
+lxc.cgroup.devices.allow = c 1:3 rwm
+lxc.cgroup.devices.allow = c 1:5 rwm
+# consoles
+lxc.cgroup.devices.allow = c 5:1 rwm
+lxc.cgroup.devices.allow = c 5:0 rwm
+lxc.cgroup.devices.allow = c 4:0 rwm
+lxc.cgroup.devices.allow = c 4:1 rwm
+# /dev/{,u}random
+lxc.cgroup.devices.allow = c 1:9 rwm
+lxc.cgroup.devices.allow = c 1:8 rwm
+lxc.cgroup.devices.allow = c 136:* rwm
+lxc.cgroup.devices.allow = c 5:2 rwm
+# rtc
+lxc.cgroup.devices.allow = c 254:0 rwm
+EOF
+}
+
+sub etc_interfaces
+{
+    return <<EOF;
+auto lo eth0
+
+iface lo inet loopback
+
+iface eth0 inet static
+	address $ipaddr
+	netmask 255.255.0.0
+	gateway $gwaddr
+EOF
+}
+
+sub etc_resolvconf
+{
+    return <<EOF;
+domain $domain
+search $domain mate1 evo gene
+nameserver 10.10.1.2
+nameserver 10.5.1.2
+EOF
+}
+
+__END__
