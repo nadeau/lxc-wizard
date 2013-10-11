@@ -421,9 +421,12 @@ sub build_cache
     die "Cache directory already exists; not overwriting\n"
 	if( -d $cache );
 
-    print "Creating cache directory... ";
-    $rc = mkdir '/var/cache/lxc';
-    checkrc( $rc );
+    unless( -d '/var/cache/lxc' )
+    {
+      print "Creating cache directory... ";
+      $rc = mkdir '/var/cache/lxc';
+      checkrc( $rc );
+    }
 
     print "Creating download directory... ";
     $rc = mkdir $partial;
@@ -583,9 +586,8 @@ sub etc_resolvconf
 {
     return <<EOF;
 domain $domain
-search $domain mate1 evo gene
-nameserver 10.10.1.2
-nameserver 10.5.1.2
+search $domain 
+nameserver 8.8.8.8
 EOF
 }
 
